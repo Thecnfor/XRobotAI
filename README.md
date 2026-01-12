@@ -1,7 +1,7 @@
 # ROS2 快速上手指南
 
 本文档面向本项目的 ROS2（Humble）开发流程：进入容器 → 初始化工作空间 → 创建包 → 编译（全量/单包）→ 运行（launch/单点测试）。
-
+sudo docker cp isaac-lab-course-test:/workspace/isaaclab/usd/new_script.py .
 ## 1. 进入容器
 
 在主机终端执行：
