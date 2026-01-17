@@ -67,11 +67,20 @@ public:
   {
     map_frame_ = declare_parameter<std::string>("map_frame", "map");
     odom_topic_ = declare_parameter<std::string>("odom_topic", "/odom");
+    odom_out_topic_ = declare_parameter<std::string>("odom_out", "/odom_fixed");
     laser_in_topic_ = declare_parameter<std::string>("laser_in", "/laser_scan");
     laser_out_topic_ = declare_parameter<std::string>("laser_out", "/scan");
     odom_frame_override_ = declare_parameter<std::string>("odom_frame", "");
     base_frame_override_ = declare_parameter<std::string>("base_frame", "");
     publish_static_laser_tf_ = declare_parameter<bool>("publish_static_laser_tf", true);
+    publish_static_base_footprint_tf_ =
+      declare_parameter<bool>("publish_static_base_footprint_tf", true);
+    base_footprint_frame_ =
+      declare_parameter<std::string>("base_footprint_frame", "base_footprint");
+    publish_bootstrap_odom_tf_ = declare_parameter<bool>("publish_bootstrap_odom_tf", true);
+    publish_static_map_to_odom_tf_ =
+      declare_parameter<bool>("publish_static_map_to_odom_tf", true);
+    force_timestamp_now_ = declare_parameter<bool>("force_timestamp_now", true);
 
     publish_initial_pose_ = declare_parameter<bool>("publish_initial_pose", true);
     initial_pose_source_ = declare_parameter<std::string>("initial_pose_source", "odom");
@@ -98,26 +107,49 @@ public:
     static_tf_broadcaster_ = std::make_shared<tf2_ros::StaticTransformBroadcaster>(*this);
 
     scan_pub_ = create_publisher<sensor_msgs::msg::LaserScan>(laser_out_topic_, rclcpp::QoS(10));
+    odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(odom_out_topic_, rclcpp::QoS(10));
     scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
       laser_in_topic_, rclcpp::QoS(10),
       [this](sensor_msgs::msg::LaserScan::SharedPtr msg) {
-        this->on_scan(*msg);
-        scan_pub_->publish(*msg);
+        auto out = *msg;
+        if (force_timestamp_now_ ||
+        (out.header.stamp.sec == 0 && out.header.stamp.nanosec == 0))
+        {
+          out.header.stamp = now();
+        }
+        this->on_scan(out);
+        scan_pub_->publish(out);
       });
 
     odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
       odom_topic_, rclcpp::QoS(10),
       [this](nav_msgs::msg::Odometry::SharedPtr msg) {
+        auto out = *msg;
+        if (force_timestamp_now_ ||
+        (out.header.stamp.sec == 0 && out.header.stamp.nanosec == 0))
+        {
+          out.header.stamp = now();
+        }
+        if (!odom_frame_override_.empty()) {
+          out.header.frame_id = odom_frame_override_;
+        }
+        if (!base_frame_override_.empty()) {
+          out.child_frame_id = base_frame_override_;
+        }
+        odom_pub_->publish(out);
         {
           std::lock_guard<std::mutex> lock(odom_mutex_);
-          last_odom_ = *msg;
+          last_odom_ = out;
           has_odom_ = true;
         }
-        this->on_odom(*msg);
+        this->on_odom(out);
         odom_cv_.notify_all();
       });
 
     action_client_ = rclcpp_action::create_client<NavigateToPose>(this, action_name_);
+
+    bootstrap_tf_timer_ =
+      create_wall_timer(100ms, [this]() {this->maybe_publish_bootstrap_odom_tf();});
 
     worker_thread_ = std::thread([this]() {this->run();});
   }
@@ -186,6 +218,7 @@ private:
       std::lock_guard<std::mutex> lock(frames_mutex_);
       last_base_frame_ = base_frame;
     }
+    maybe_publish_static_base_footprint_tf();
     maybe_publish_static_laser_tf();
   }
 
@@ -221,7 +254,8 @@ private:
     }
 
     geometry_msgs::msg::TransformStamped tf;
-    tf.header.stamp = now();
+    tf.header.stamp.sec = 0;
+    tf.header.stamp.nanosec = 0;
     tf.header.frame_id = base_frame;
     tf.child_frame_id = laser_frame;
     tf.transform.translation.x = 0.0;
@@ -230,6 +264,103 @@ private:
     tf.transform.rotation = quat_from_yaw(0.0);
     static_tf_broadcaster_->sendTransform(tf);
     static_laser_tf_sent_.store(true);
+  }
+
+  void maybe_publish_static_base_footprint_tf()
+  {
+    if (!publish_static_base_footprint_tf_ || static_base_footprint_tf_sent_.load()) {
+      return;
+    }
+
+    std::string base_frame;
+    {
+      std::lock_guard<std::mutex> lock(frames_mutex_);
+      base_frame = last_base_frame_;
+    }
+
+    if (base_frame.empty() || base_footprint_frame_.empty() ||
+      base_frame == base_footprint_frame_)
+    {
+      return;
+    }
+
+    geometry_msgs::msg::TransformStamped tf;
+    tf.header.stamp.sec = 0;
+    tf.header.stamp.nanosec = 0;
+    tf.header.frame_id = base_frame;
+    tf.child_frame_id = base_footprint_frame_;
+    tf.transform.translation.x = 0.0;
+    tf.transform.translation.y = 0.0;
+    tf.transform.translation.z = 0.0;
+    tf.transform.rotation = quat_from_yaw(0.0);
+    static_tf_broadcaster_->sendTransform(tf);
+    static_base_footprint_tf_sent_.store(true);
+  }
+
+  void maybe_publish_static_map_to_odom_tf()
+  {
+    if (!publish_static_map_to_odom_tf_ || static_map_to_odom_tf_sent_.load() ||
+      stop_requested_.load())
+    {
+      return;
+    }
+
+    if (map_frame_.empty() || odom_frame_override_.empty() || map_frame_ == odom_frame_override_) {
+      return;
+    }
+
+    geometry_msgs::msg::TransformStamped tf;
+    tf.header.stamp.sec = 0;
+    tf.header.stamp.nanosec = 0;
+    tf.header.frame_id = map_frame_;
+    tf.child_frame_id = odom_frame_override_;
+    tf.transform.translation.x = 0.0;
+    tf.transform.translation.y = 0.0;
+    tf.transform.translation.z = 0.0;
+    tf.transform.rotation = quat_from_yaw(0.0);
+    static_tf_broadcaster_->sendTransform(tf);
+    static_map_to_odom_tf_sent_.store(true);
+  }
+
+  void maybe_publish_bootstrap_odom_tf()
+  {
+    if (!publish_bootstrap_odom_tf_ || stop_requested_.load()) {
+      return;
+    }
+
+    maybe_publish_static_map_to_odom_tf();
+
+    bool has_odom = false;
+    {
+      std::lock_guard<std::mutex> lock(odom_mutex_);
+      has_odom = has_odom_;
+    }
+    if (has_odom) {
+      return;
+    }
+
+    if (odom_frame_override_.empty() || base_frame_override_.empty() ||
+      odom_frame_override_ == base_frame_override_)
+    {
+      return;
+    }
+
+    geometry_msgs::msg::TransformStamped tf;
+    tf.header.stamp = now();
+    tf.header.frame_id = odom_frame_override_;
+    tf.child_frame_id = base_frame_override_;
+    tf.transform.translation.x = 0.0;
+    tf.transform.translation.y = 0.0;
+    tf.transform.translation.z = 0.0;
+    tf.transform.rotation = quat_from_yaw(0.0);
+    tf_broadcaster_->sendTransform(tf);
+
+    {
+      std::lock_guard<std::mutex> lock(frames_mutex_);
+      last_base_frame_ = base_frame_override_;
+    }
+    maybe_publish_static_base_footprint_tf();
+    maybe_publish_static_laser_tf();
   }
 
   geometry_msgs::msg::PoseWithCovarianceStamped make_initial_pose_from_params()
@@ -324,37 +455,47 @@ private:
     NavigateToPose::Goal goal_msg;
     goal_msg.pose = goal_pose;
 
-    auto send_goal_options = rclcpp_action::Client<NavigateToPose>::SendGoalOptions();
+    rclcpp_action::Client<NavigateToPose>::SendGoalOptions send_goal_options;
     send_goal_options.result_callback =
       [this](const GoalHandleNavigateToPose::WrappedResult & result) {
         last_result_code_ = result.code;
         result_cv_.notify_all();
       };
 
-    auto goal_handle_future = action_client_->async_send_goal(goal_msg, send_goal_options);
+    GoalHandleNavigateToPose::SharedPtr goal_handle;
+    const auto goal_send_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (rclcpp::ok() && !stop_requested_.load()) {
+      auto goal_handle_future = action_client_->async_send_goal(goal_msg, send_goal_options);
 
-    if (rclcpp::spin_until_future_complete(get_node_base_interface(), goal_handle_future, 10s) !=
-      rclcpp::FutureReturnCode::SUCCESS)
-    {
-      RCLCPP_ERROR(get_logger(), "Failed to send goal");
-      return;
-    }
-
-    auto goal_handle = goal_handle_future.get();
-    if (!goal_handle) {
-      RCLCPP_ERROR(get_logger(), "Goal was rejected by server");
-      return;
-    }
-
-    {
-      std::unique_lock<std::mutex> lock(result_mutex_);
-      while (rclcpp::ok() && !stop_requested_.load()) {
-        if (result_cv_.wait_for(lock, 500ms) == std::cv_status::timeout) {
-          continue;
+      if (goal_handle_future.wait_for(10s) != std::future_status::ready) {
+        RCLCPP_WARN(get_logger(), "Timed out waiting goal response, retrying");
+      } else {
+        goal_handle = goal_handle_future.get();
+        if (goal_handle) {
+          break;
         }
-        break;
+        RCLCPP_WARN(get_logger(), "Goal was rejected by server, retrying");
       }
+
+      if (std::chrono::steady_clock::now() >= goal_send_deadline) {
+        RCLCPP_ERROR(get_logger(), "Failed to get goal accepted within timeout");
+        return;
+      }
+      std::this_thread::sleep_for(500ms);
     }
+
+    if (!rclcpp::ok() || stop_requested_.load()) {
+      return;
+    }
+
+    auto result_future = action_client_->async_get_result(goal_handle);
+    if (result_future.wait_for(std::chrono::minutes(10)) != std::future_status::ready) {
+      RCLCPP_ERROR(get_logger(), "Timed out waiting navigation result");
+      return;
+    }
+
+    last_result_code_ = result_future.get().code;
 
     if (last_result_code_ == rclcpp_action::ResultCode::SUCCEEDED) {
       RCLCPP_INFO(get_logger(), "Navigation succeeded");
@@ -367,11 +508,17 @@ private:
 
   std::string map_frame_;
   std::string odom_topic_;
+  std::string odom_out_topic_;
   std::string laser_in_topic_;
   std::string laser_out_topic_;
   std::string odom_frame_override_;
   std::string base_frame_override_;
+  bool publish_static_base_footprint_tf_{true};
+  std::string base_footprint_frame_;
   bool publish_static_laser_tf_{true};
+  bool publish_bootstrap_odom_tf_{true};
+  bool publish_static_map_to_odom_tf_{true};
+  bool force_timestamp_now_{true};
 
   bool publish_initial_pose_{true};
   std::string initial_pose_source_;
@@ -393,16 +540,20 @@ private:
 
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initialpose_pub_;
   rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr scan_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp_action::Client<NavigateToPose>::SharedPtr action_client_;
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
   std::shared_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
+  rclcpp::TimerBase::SharedPtr bootstrap_tf_timer_;
 
   std::mutex frames_mutex_;
   std::string last_base_frame_;
   std::string last_laser_frame_;
   std::atomic<bool> static_laser_tf_sent_{false};
+  std::atomic<bool> static_base_footprint_tf_sent_{false};
+  std::atomic<bool> static_map_to_odom_tf_sent_{false};
 
   std::mutex odom_mutex_;
   std::condition_variable odom_cv_;

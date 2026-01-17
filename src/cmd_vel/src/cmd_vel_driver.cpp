@@ -12,12 +12,17 @@ public:
   CmdVelDriverNode()
   : rclcpp::Node("cmd_vel_driver")
   {
+    enabled_ = declare_parameter<bool>("enabled", false);
     topic_ = declare_parameter<std::string>("topic", "/cmd_vel");
     linear_x_ = declare_parameter<double>("linear_x", 20);
     angular_z_ = declare_parameter<double>("angular_z", 0.2);
     rate_hz_ = declare_parameter<double>("rate_hz", 10.0);
 
     publisher_ = create_publisher<geometry_msgs::msg::Twist>(topic_, rclcpp::QoS(10));
+
+    if (!enabled_) {
+      return;
+    }
 
     const auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::duration<double>(1.0 / std::max(0.1, rate_hz_)));
@@ -33,6 +38,7 @@ private:
     publisher_->publish(msg);
   }
 
+  bool enabled_{false};
   std::string topic_;
   double linear_x_{0.0};
   double angular_z_{0.0};
